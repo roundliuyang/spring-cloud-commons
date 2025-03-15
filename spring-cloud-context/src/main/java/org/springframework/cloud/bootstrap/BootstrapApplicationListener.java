@@ -102,9 +102,8 @@ public class BootstrapApplicationListener implements ApplicationListener<Applica
 			return;
 		}
 		// don't listen to events in a bootstrap context
-		// Spring 自动装配机制并不支持将 ApplicationListener 指定给某个单独的 ApplicationContext
-		// 因此创建 bootstrap context 和 main context 时都会回调这个 ApplicationListener
-		// 显然，创建 main context 时才是我们感兴趣的时间节点
+		// BootstrapApplicationListener通过判断Environment中是否存在bootstrap这个PropertySource辨别当前容器是否是Bootstrap容器，
+		// 以解决无限监听到ApplicationEnvironmentPreparedEvent事件启动新容器的问题。
 		if (environment.getPropertySources().contains(BOOTSTRAP_PROPERTY_SOURCE_NAME)) {
 			return;
 		}
