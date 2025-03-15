@@ -95,23 +95,36 @@ public class BootstrapApplicationListener implements ApplicationListener<Applica
 
 	@Override
 	public void onApplicationEvent(ApplicationEnvironmentPreparedEvent event) {
+		// SpringBoot 应用启动时创建的 Environment
 		ConfigurableEnvironment environment = event.getEnvironment();
+		// 首先检查此特性是否开启
 		if (!bootstrapEnabled(environment) && !useLegacyProcessing(environment)) {
 			return;
 		}
 		// don't listen to events in a bootstrap context
+		// Spring 自动装配机制并不支持将 ApplicationListener 指定给某个单独的 ApplicationContext
+		// 因此创建 bootstrap context 和 main context 时都会回调这个 ApplicationListener
+		// 显然，创建 main context 时才是我们感兴趣的时间节点
 		if (environment.getPropertySources().contains(BOOTSTRAP_PROPERTY_SOURCE_NAME)) {
 			return;
 		}
 		ConfigurableApplicationContext context = null;
+		// bootstrap 只是 bootstrap context 使用的配置文件的默认名称
+		// 可以在 System Properties 中进行指定，比如 -Dspring.cloud.bootstrap.name=some-file-name
 		String configName = environment.resolvePlaceholders("${spring.cloud.bootstrap.name:bootstrap}");
+		// 看看开发者是否有打算给 main context 设置父容器，一般是没有的
 		for (ApplicationContextInitializer<?> initializer : event.getSpringApplication().getInitializers()) {
+			// ParentContextApplicationContextInitializer 是专门负责设置父容器的
 			if (initializer instanceof ParentContextApplicationContextInitializer) {
 				context = findBootstrapContext((ParentContextApplicationContextInitializer) initializer, configName);
 			}
 		}
+
+		// 开发者没有自行配置 bootstrap context...
 		if (context == null) {
+			// 那就创建它，将它设置为 main context 的父容器
 			context = bootstrapServiceContext(environment, event.getSpringApplication(), configName);
+			// 给 main context 注册监听器，在其启动失败时关闭 bootstrap context
 			event.getSpringApplication().addListeners(new CloseContextOnFailureApplicationListener(context));
 		}
 
@@ -141,27 +154,38 @@ public class BootstrapApplicationListener implements ApplicationListener<Applica
 
 	private ConfigurableApplicationContext bootstrapServiceContext(ConfigurableEnvironment environment,
 			final SpringApplication application, String configName) {
+
+		// 创建一个新的 Environment 实例，作为 Bootstrap Context 的 Environment，用于存放 bootstrap.yml 和远程配置
 		ConfigurableEnvironment bootstrapEnvironment = new AbstractEnvironment() {
 		};
+		// 获取 bootstrapEnvironment 里的 PropertySources，用于存储 Bootstrap 配置项
 		MutablePropertySources bootstrapProperties = bootstrapEnvironment.getPropertySources();
 		String configLocation = environment.resolvePlaceholders("${spring.cloud.bootstrap.location:}");
 		String configAdditionalLocation = environment
 				.resolvePlaceholders("${spring.cloud.bootstrap.additional-location:}");
+
+		// 组装 Bootstrap PropertySource
+		// 这一步是为了交给 ConfigFileApplicationListener 来读取bootstrap.yml中的内容
 		Map<String, Object> bootstrapMap = new HashMap<>();
+		// configName: bootstrap
 		bootstrapMap.put("spring.config.name", configName);
-		// if an app (or test) uses spring.main.web-application-type=reactive, bootstrap
-		// will fail
-		// force the environment to use none, because if though it is set below in the
-		// builder
+		// if an app (or test) uses spring.main.web-application-type=reactive, bootstrap will fail
+		// force the environment to use none, because if though it is set below in the builder,
 		// the environment overrides it
-		bootstrapMap.put("spring.main.web-application-type", "none");
+		// 禁用 Web 组件，避免 Bootstrap Context 变成 Web 应用。
+		bootstrapMap.put("spring.main.web-application-type", "none");   
 		if (StringUtils.hasText(configLocation)) {
 			bootstrapMap.put("spring.config.location", configLocation);
 		}
+		// 如果配置了 spring.cloud.bootstrap.location 或 spring.cloud.bootstrap.additional-location，就添加到 bootstrapMap，用于远程配置加载。
 		if (StringUtils.hasText(configAdditionalLocation)) {
 			bootstrapMap.put("spring.config.additional-location", configAdditionalLocation);
 		}
+		// 把 bootstrapMap 作为最高优先级的 PropertySource 加入 bootstrapEnvironmente
 		bootstrapProperties.addFirst(new MapPropertySource(BOOTSTRAP_PROPERTY_SOURCE_NAME, bootstrapMap));
+		
+		// 把 Main Context 里的 PropertySource 复制到 Bootstrap Context，以便 Bootstrap 能访问主应用配置。
+		// 忽略 StubPropertySource，因为它是占位符。
 		for (PropertySource<?> source : environment.getPropertySources()) {
 			if (source instanceof StubPropertySource) {
 				continue;
@@ -169,11 +193,25 @@ public class BootstrapApplicationListener implements ApplicationListener<Applica
 			bootstrapProperties.addLast(source);
 		}
 		// TODO: is it possible or sensible to share a ResourceLoader?
-		SpringApplicationBuilder builder = new SpringApplicationBuilder().profiles(environment.getActiveProfiles())
+		/*
+		 * 创建 SpringApplicationBuilder，用于初始化 Bootstrap Context：
+		 * 继承 Main Context 的 Active Profiles。
+		 * 关闭 banner（日志不打印 Spring Boot 启动图）。
+		 * 设置 bootstrapEnvironment 作为 Environment。
+		 * 关闭 Shutdown Hook（Bootstrap Context 退出时不影响主应用）。
+		 * 禁用 Web 环境，WebApplicationType.NONE。
+		 */
+		SpringApplicationBuilder builder = new SpringApplicationBuilder()
+				.profiles(environment.getActiveProfiles())
 				.bannerMode(Mode.OFF).environment(bootstrapEnvironment)
 				// Don't use the default properties in this builder
-				.registerShutdownHook(false).logStartupInfo(false).web(WebApplicationType.NONE);
+				.registerShutdownHook(false)
+				.logStartupInfo(false)
+				.web(WebApplicationType.NONE);
+		// 获取 SpringApplication 实例
 		final SpringApplication builderApplication = builder.application();
+		
+		// 如果 MainApplicationClass 为空（比如 WAR 部署时），就从 application 里获取 MainApplicationClass
 		if (builderApplication.getMainApplicationClass() == null) {
 			// gh_425:
 			// SpringApplication cannot deduce the MainApplicationClass here
@@ -184,25 +222,41 @@ public class BootstrapApplicationListener implements ApplicationListener<Applica
 			// set by SpringBootServletInitializer itself already.
 			builder.main(application.getMainApplicationClass());
 		}
+		// 如果 Main Context 处于 refresh 状态（如 @RefreshScope 触发）
 		if (environment.getPropertySources().contains("refreshArgs")) {
 			// If we are doing a context refresh, really we only want to refresh the
 			// Environment, and there are some toxic listeners (like the
 			// LoggingApplicationListener) that affect global static state, so we need a
 			// way to switch those off.
+			// 过滤掉 LoggingApplicationListener，避免 Logging 影响全局状态。
 			builderApplication.setListeners(filterListeners(builderApplication.getListeners()));
 		}
+		// 允许使用 SPI 机制指定 Bootstrap Configuration
+		// 允许通过 @Import(BootstrapImportSelectorConfiguration.class) 指定额外的 Bootstrap Configuration（如 PropertySourceLocator）
 		builder.sources(BootstrapImportSelectorConfiguration.class);
+		
+		// 启动 Bootstrap Context，执行自动装配：
+		// • ConfigFileApplicationListener 读取 bootstrap.yml
+		// • PropertySourceLocator 加载 远程配置（如 Nacos、Config Server）
 		final ConfigurableApplicationContext context = builder.run();
+		
 		// gh-214 using spring.application.name=bootstrap to set the context id via
 		// `ContextIdApplicationContextInitializer` prevents apps from getting the actual
 		// spring.application.name
 		// during the bootstrap phase.
+		// 设置 Bootstrap Context 的 ID 为 bootstrap，防止影响 Main Context 的 spring.application.name
 		context.setId("bootstrap");
+		
 		// Make the bootstrap context a parent of the app context
+		// 把 Bootstrap Context 设为 Main Context 的父容器，这样 Main Context 能访问 Bootstrap Context 的 Bean 和 Environment。
 		addAncestorInitializer(application, context);
+		
 		// It only has properties in it now that we don't want in the parent so remove
 		// it (and it will be added back later)
+		// 移除 bootstrapProperties，因为 Bootstrap Context 启动完后，这些配置已经被 Main Context 继承了。
 		bootstrapProperties.remove(BOOTSTRAP_PROPERTY_SOURCE_NAME);
+		
+		// 把 Bootstrap Context 的 PropertySource 合并到 Main Context，确保 Main Context 能访问 Bootstrap 加载的远程配置
 		mergeDefaultProperties(environment.getPropertySources(), bootstrapProperties);
 		return context;
 	}
